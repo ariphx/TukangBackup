@@ -146,9 +146,27 @@ Lalu tambahkan baris ini (sesuaikan path-nya):
 
 *Perintah `cd` memastikan script dijalankan dari direktori yang benar sehingga bisa menemukan `config.ini`.*
 
-## Kontribusi
+## 🤝 Kontribusi (Contributing)
 
-Saran, laporan bug, dan kontribusi sangat diterima. Silakan buat *Issue* atau *Pull Request*.
+Saran, laporan bug, dan kontribusi untuk membuat `TukangBackup.pykit` menjadi lebih baik sangat diterima.
+
+-   Untuk **laporan bug** atau **saran fitur baru**, silakan buat [*Issue* baru](https://github.com/ariphx/TukangBackup/issues).
+-   Untuk **kontribusi kode**, silakan buat [*Pull Request*](https://github.com/ariphx/TukangBackup/pulls).
+-   Jika ada pertanyaan atau ingin berdiskusi lebih lanjut, jangan ragu untuk menghubungi saya via **[Facebook](https://fb.me/arif.kun.456)**.
+
+---
+
+## 🙏 Dukungan (Support)
+
+`TukangBackup.pykit` adalah proyek sumber terbuka (*open source*) yang saya kembangkan dan rawat di waktu luang.
+
+Jika Anda merasa tools ini bermanfaat dan ingin memberikan sedikit apresiasi, Anda bisa mendukung saya dengan mentraktir secangkir kopi melalui Trakteer. Setiap dukungan, berapapun nilainya, sangat berarti dan memotivasi saya untuk terus mengembangkan proyek ini.
+
+Terima kasih banyak atas dukungan Anda!
+
+<a href="https://trakteer.id/ariphx/tip" target="_blank"><img id="wse-buttons-preview" src="https://cdn.trakteer.id/images/embed/trbtn-red-5.png" height="50" style="border:0px;height:50px;" alt="Trakteer, Traktir Kopi"></a>
+
+---
 
 ## Lisensi
 
