@@ -7,7 +7,9 @@ import sys
 import configparser
 import time
 import requests
+import socket
 
+# Import PyDrive2 Modules
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
@@ -31,12 +33,14 @@ if not os.path.exists(config_file):
 
 try:
     config.read(config_file)
-    NAMA_SERVER = config['SSH']['server_name']
+    NAMA_SERVER_SSH = config['SSH']['server_name']
     NAMA_USER_SSH = config['SSH']['user']
     ALAMAT_IP_SERVER = config['SSH']['server_ip']
+    
     NAMA_USER_DB = config['DATABASE']['user']
     PASSWORD_DB = config['DATABASE']['password']
     DB_HOST = config.get('DATABASE', 'host', fallback='localhost')
+
     FOLDER_TUJUAN_LOKAL = config['LOCAL']['destination_folder']
     HAPUS_BACKUP_LAMA_HARI = config.getint('LOCAL', 'cleanup_after_days')
     GDRIVE_FOLDER_ID = config.get('GDRIVE', 'destination_folder_id', fallback='')
@@ -45,6 +49,8 @@ try:
     TELEGRAM_BOT_TOKEN = config.get('TELEGRAM', 'telegram_bot_token', fallback='')
     TELEGRAM_CHAT_ID = config.get('TELEGRAM', 'telegram_chat_id', fallback='')
     SEND_TELEGRAM_NOTIFICATION = config.getboolean('TELEGRAM', 'send_telegram_notification', fallback=False)
+
+    DEFAULT_BACKUP_MODE = config.get('MAIN', 'default_backup_mode', fallback='ssh').lower() if 'MAIN' in config else 'ssh'
 
     if not os.path.isabs(FOLDER_TUJUAN_LOKAL):
         print(f"{Tampilan.WARNING}[WARNING]{Tampilan.ENDC} 'destination_folder' di [LOCAL] harus berupa path absolut. Menggunakan path relatif dari direktori skrip.")
@@ -75,10 +81,10 @@ def tampilkan_banner():
     """Menampilkan banner ASCII Art."""
     banner = r"""
     ____ <==> ____
-    \___\(**)/___/            TukangBackup.pykit
-     \___|  |___/     auto backup all database via login ssh
-         L  J                     
-         |__|              https://github.com/ariphx/
+    \___\(**)/___/          TukangBackup.pykit
+     \___|  |___/   multi-mode auto backup all database
+         L  J
+         |__|           https://github.com/ariphx/
           vv
     """
     print(f"{Tampilan.BOLD}{banner}{Tampilan.ENDC}")
@@ -235,14 +241,20 @@ def show_config():
     tampilkan_banner()
     print(f"\n{Tampilan.BOLD}[TukangBackup Current Configuration]{Tampilan.ENDC}")
     print("-" * 45)
+    
+    if 'MAIN' in config and 'default_backup_mode' in config['MAIN']:
+        print(f"{Tampilan.BOLD}[MAIN]{Tampilan.ENDC}")
+        print(f"  - default_backup_mode: {config['MAIN']['default_backup_mode']}")
+        print("-" * 45)
+
     print(f"{Tampilan.BOLD}[SSH]{Tampilan.ENDC}")
-    print(f"  - server_name : {NAMA_SERVER}")
+    print(f"  - server_name : {NAMA_SERVER_SSH}")
     print(f"  - user        : {NAMA_USER_SSH}")
     print(f"  - server_ip   : {ALAMAT_IP_SERVER}")
     print(f"{Tampilan.BOLD}[DATABASE]{Tampilan.ENDC}")
     print(f"  - user        : {NAMA_USER_DB}")
     print(f"  - password    : {'*' * len(PASSWORD_DB) if PASSWORD_DB else '(kosong)'}")
-    print(f"  - host        : {DB_HOST if DB_HOST != 'localhost' else 'localhost (sama dengan server SSH)'}")
+    print(f"  - host        : {DB_HOST if DB_HOST != 'localhost' else 'localhost (sama dengan server ini)'}")
     print(f"{Tampilan.BOLD}[LOCAL]{Tampilan.ENDC}")
     print(f"  - destination : {FOLDER_TUJUAN_LOKAL}")
     print(f"  - cleanup_days: {HAPUS_BACKUP_LAMA_HARI}")
@@ -263,17 +275,23 @@ def show_help():
     print("\n---")
     print(f"{Tampilan.BOLD}Deskripsi:{Tampilan.ENDC}")
     print("  TukangBackup.pykit adalah skrip Python untuk otomatisasi backup")
-    print("  database MySQL/MariaDB dari server remote via SSH. Hasil backup")
-    print("  akan dikompresi, diunggah ke Google Drive, dan statusnya dikirim")
-    print("  melalui notifikasi Telegram.")
+    print("  database MySQL/MariaDB. Mendukung backup dari server remote via SSH")
+    print("  atau langsung dari server lokal. Hasil backup akan dikompresi,")
+    print("  diunggah ke Google Drive, dan statusnya dikirim melalui Telegram.")
     print("\n---")
     print(f"{Tampilan.BOLD}Penggunaan:{Tampilan.ENDC}")
     print(f"  {Tampilan.FAIL}python TukangBackup.pykit [COMMAND] [ARGUMEN]{Tampilan.ENDC}")
     print("\n---")
     print(f"{Tampilan.BOLD}Daftar COMMAND:{Tampilan.ENDC}")
-    print(f"  * {Tampilan.FAIL}backup{Tampilan.ENDC}")
-    print("    Menjalankan proses backup lengkap (unduh, kompres, upload).")
-    print("    (Ini juga command default jika dijalankan tanpa argumen.)")
+    print(f"  * {Tampilan.FAIL}ssh-backup{Tampilan.ENDC}")
+    print("    Menjalankan proses backup database dari server remote via SSH.")
+    print("    (Mode default jika `default_backup_mode` di config.ini adalah 'ssh' atau tidak diset).")
+    print(f"  * {Tampilan.FAIL}lokal-backup{Tampilan.ENDC}")
+    print("    Menjalankan proses backup database langsung dari server lokal.")
+    print("    (Mode default jika `default_backup_mode` di config.ini adalah 'lokal').")
+    print("\n  • Command tanpa argumen (misal: `python TukangBackup.pykit`) akan")
+    print("    menggunakan `default_backup_mode` yang diatur di `config.ini`.")
+    print("\n---")
     print(f"  * {Tampilan.FAIL}status{Tampilan.ENDC}")
     print("    Menampilkan ringkasan status backup terakhir.")
     print(f"  * {Tampilan.FAIL}config{Tampilan.ENDC}")
@@ -314,7 +332,7 @@ def show_help():
     print("  Untuk menjalankan backup otomatis secara berkala menggunakan cron job:")
     print(f"  1. Buka terminal dan ketik: {Tampilan.FAIL}crontab -e{Tampilan.ENDC}")
     print("  2. Tambahkan baris baru di akhir file (sesuaikan dengan jadwal Anda):")
-    print(f"     {Tampilan.FAIL}0 3 * * * /usr/bin/python3 /path/to/TukangBackup.pykit backup >> /var/log/tukangbackup.log 2>&1{Tampilan.ENDC}")
+    print(f"     {Tampilan.FAIL}0 3 * * * /usr/bin/python3 /path/to/TukangBackup.pykit [backup_mode] >> /var/log/tukangbackup.log 2>&1{Tampilan.ENDC}")
     print("\n  Penjelasan:")
     print(f"  * {Tampilan.FAIL}0 3 * * *{Tampilan.ENDC} : Jadwal (di sini, setiap hari jam 3 pagi).")
     print("    (menit jam hari_bulan bulan hari_minggu)")
@@ -322,7 +340,7 @@ def show_help():
     print("    (Gunakan `which python3` untuk mencari path yang benar).")
     print(f"  * {Tampilan.FAIL}/path/to/TukangBackup.pykit{Tampilan.ENDC} : Path lengkap ke skrip Anda.")
     print("    (Misalnya, `/home/user/my_backup_project/TukangBackup.pykit`).")
-    print(f"  * {Tampilan.FAIL}backup{Tampilan.ENDC} : Memanggil command 'backup' secara eksplisit.")
+    print(f"  * {Tampilan.FAIL}[backup_mode]{Tampilan.ENDC} : Ganti dengan `ssh-backup` (untuk SSH) atau `lokal-backup` (untuk lokal).")
     print(f"  * {Tampilan.FAIL}>> /var/log/tukangbackup.log 2>&1{Tampilan.ENDC} : Mengarahkan output")
     print("    dan error ke file log untuk debugging (disarankan).")
     print("  3. Simpan dan keluar dari editor (biasanya Ctrl+X, Y, Enter untuk nano).")
@@ -349,11 +367,11 @@ def test_telegram_notification():
     pesan_tes = (
         f"✨ <b>TukangBackupBot Status</b>\n\n"
         f"✅ <i>Tes Notifikasi Berhasil</i>\n"
-        f"Server: <code>{NAMA_SERVER}</code>\n"
+        f"Server: <code>{NAMA_SERVER_SSH}</code>\n" # Menggunakan NAMA_SERVER_SSH untuk pesan tes
         f"Waktu: {datetime.datetime.now().strftime('%H:%M:%S, %d %b %Y')}"
     )
 
-    print("  -> Mencoba mengirim pesan tes ke Telegram...")
+    print("  [STATUS] Mencoba mengirim pesan tes ke Telegram...")
     kirim_berhasil = kirim_pesan_telegram(pesan_tes)
 
     if kirim_berhasil:
@@ -370,14 +388,14 @@ def run_gdrive_test():
     print(f"\n{Tampilan.BOLD}[Tes Koneksi Google Drive]{Tampilan.ENDC}")
     print("-" * 45)
     try:
-        print("  -> Mencoba otentikasi ke Google Drive...")
+        print("  [STATUS] Mencoba otentikasi ke Google Drive...")
         drive = gdrive_auth()
         print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Otentikasi Google Drive berhasil.")
 
         if not GDRIVE_FOLDER_ID:
             print(f"  {Tampilan.WARNING}[INFO]{Tampilan.ENDC} ID Folder GDrive tidak diset di konfigurasi. Tes hanya sampai otentikasi.")
         else:
-            print(f"  -> Mencoba melihat folder GDrive (ID: {GDRIVE_FOLDER_ID[:15]}...)...")
+            print(f"  [STATUS] Mencoba melihat folder GDrive (ID: {GDRIVE_FOLDER_ID[:15]}...)...")
             folder = drive.CreateFile({'id': GDRIVE_FOLDER_ID})
             folder.FetchMetadata(fields='title')
             print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Berhasil terhubung ke folder '{Tampilan.OKGREEN}{folder['title']}{Tampilan.ENDC}'.")
@@ -415,12 +433,24 @@ def upload_ke_gdrive(file_path):
         print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Gagal upload ke Google Drive: {e}")
         return False
 
-def buat_backup_remote_db():
-    """Fungsi inti untuk menjalankan seluruh proses backup."""
+# Fungsi inti yang kini mendukung mode SSH dan Lokal
+def jalankan_proses_backup(mode):
+    """Fungsi inti untuk menjalankan seluruh proses backup (SSH atau lokal)."""
     waktu_backup_terakhir = get_last_backup_time()
     print(f"{Tampilan.BOLD}[DETAIL PROSES]{Tampilan.ENDC}")
     print(f"  - Waktu           : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  - Server          : {NAMA_SERVER} [{ALAMAT_IP_SERVER}]")
+    print(f"  - Mode Backup     : {'Lokal' if mode == 'lokal' else 'SSH'}")
+    
+    current_server_name_display = NAMA_SERVER_SSH
+    current_server_ip_display = ALAMAT_IP_SERVER
+
+    if mode == 'lokal':
+        current_server_name_display = socket.gethostname()
+        current_server_ip_display = socket.gethostbyname(current_server_name_display)
+        print(f"  - Server          : {current_server_name_display} ({current_server_ip_display}) (Lokal)")
+    else:
+        print(f"  - Server          : {current_server_name_display} [{current_server_ip_display}] (Remote)")
+
     print(f"  - Tujuan Lokal    : {FOLDER_TUJUAN_LOKAL}")
     print(f"  - Tujuan GDrive   : {GDRIVE_FOLDER_ID if GDRIVE_FOLDER_ID else 'Tidak Aktif'}")
     print(f"  - Backup Terakhir : {waktu_backup_terakhir}")
@@ -443,11 +473,16 @@ def buat_backup_remote_db():
             f"MYSQL_PWD={shlex.quote(PASSWORD_DB)} mysqldump -u {shlex.quote(NAMA_USER_DB)}{host_option} "
             f"--all-databases --routines --events --triggers --no-tablespaces"
         )
-        perintah_ssh_full = ["ssh", f"{NAMA_USER_SSH}@{ALAMAT_IP_SERVER}", perintah_dump]
 
-        print(f"  [STATUS] Menjalankan mysqldump dari remote server...")
+        if mode == 'ssh':
+            perintah_eksekusi = ["ssh", f"{NAMA_USER_SSH}@{ALAMAT_IP_SERVER}", perintah_dump]
+            print(f"  [STATUS] Menjalankan mysqldump via SSH dari remote server...")
+        else:
+            perintah_eksekusi = shlex.split(perintah_dump)
+            print(f"  [STATUS] Menjalankan mysqldump secara lokal...")
+
         with open(path_file_sql_lokal, "wb") as file_output:
-            proses = subprocess.Popen(perintah_ssh_full, stdout=file_output, stderr=subprocess.PIPE, shell=False)
+            proses = subprocess.Popen(perintah_eksekusi, stdout=file_output, stderr=subprocess.PIPE, shell=False)
             stderr_output = proses.communicate()[1]
 
             if proses.returncode != 0:
@@ -456,7 +491,7 @@ def buat_backup_remote_db():
                 if os.path.exists(path_file_sql_lokal):
                     os.remove(path_file_sql_lokal)
                 return False
-        print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Backup database (.sql) berhasil diunduh ke lokal.")
+        print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Backup database (.sql) berhasil dibuat.")
 
         path_file_targz = path_file_sql_lokal.replace(".sql", ".tar.gz")
         print(f"  [STATUS] Mengompres file SQL ke {os.path.basename(path_file_targz)}...")
@@ -477,7 +512,10 @@ def buat_backup_remote_db():
         return True
 
     except FileNotFoundError as e:
-        print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Perintah tidak ditemukan: {e}. Pastikan 'ssh' atau 'mysqldump' (jika diakses lokal) terinstal dan ada di PATH.")
+        if mode == 'ssh':
+            print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Perintah 'ssh' tidak ditemukan. Pastikan SSH client terinstal dan ada di PATH: {e}.")
+        else:
+            print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Perintah 'mysqldump' tidak ditemukan. Pastikan MySQL client tools terinstal dan ada di PATH server ini: {e}.")
         if os.path.exists(path_file_sql_lokal): os.remove(path_file_sql_lokal)
         if os.path.exists(path_file_targz): os.remove(path_file_targz)
         return False
@@ -550,20 +588,22 @@ if __name__ == "__main__":
                 toggle_telegram_notification()
         elif command == 'help':
             show_help()
-        elif command == 'backup':
+        elif command == 'ssh-backup': # Command untuk SSH backup
             clear_screen()
             tampilkan_banner()
-            print(f"{Tampilan.BOLD}[MEMULAI PROSES BACKUP]{Tampilan.ENDC}")
+            print(f"{Tampilan.BOLD}[MEMULAI PROSES BACKUP (SSH)]{Tampilan.ENDC}")
             waktu_mulai = time.time()
-            sukses = buat_backup_remote_db()
+            sukses = jalankan_proses_backup('ssh')
             waktu_selesai = time.time()
             durasi = waktu_selesai - waktu_mulai
+            
+            # Pesan notifikasi untuk mode SSH
             if sukses:
                 pesan_sukses = f"Backup sukses tersimpan di folder: {FOLDER_TUJUAN_LOKAL}"
                 print(f"  [STATUS] {Tampilan.OKGREEN}BACKUP SUKSES{Tampilan.ENDC} : {pesan_sukses}")
                 pesan_notif = (
                     f"✅ <b>Backup Database Sukses!</b>\n\n"
-                    f"<b>Server:</b> <code>{NAMA_SERVER}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
+                    f"<b>Server:</b> <code>{NAMA_SERVER_SSH}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
                     f"<b>Waktu:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                     f"<b>Durasi Proses:</b> {format_durasi(durasi)}\n"
                     f"<b>Disimpan Lokal:</b> <code>{FOLDER_TUJUAN_LOKAL}</code>\n"
@@ -576,7 +616,43 @@ if __name__ == "__main__":
                 print(f"  [STATUS] {Tampilan.FAIL}BACKUP GAGAL{Tampilan.ENDC} : {pesan_gagal}")
                 pesan_notif = (
                     f"❌ <b>Backup Database GAGAL!</b>\n\n"
-                    f"<b>Server:</b> <code>{NAMA_SERVER}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
+                    f"<b>Server:</b> <code>{NAMA_SERVER_SSH}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
+                    f"<b>Waktu:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"<b>Durasi Proses:</b> {format_durasi(durasi)}\n"
+                    f"\n"
+                    f"❗️ <b>Pesan Error:</b> Mohon cek log di server untuk detail lebih lanjut.\n"
+                    f"<i>Tindakan segera diperlukan.</i>"
+                )
+                kirim_pesan_telegram(pesan_notif)
+            print(f"  [DETAIL] Total durasi proses: {format_durasi(durasi)}")
+        elif command == 'lokal-backup': # Command untuk backup lokal
+            clear_screen()
+            tampilkan_banner()
+            waktu_mulai = time.time()
+            sukses = jalankan_proses_backup('lokal')
+            waktu_selesai = time.time()
+            durasi = waktu_selesai - waktu_mulai
+            
+            # Pesan notifikasi untuk mode lokal
+            if sukses:
+                pesan_sukses = f"Backup sukses tersimpan di folder: {FOLDER_TUJUAN_LOKAL}"
+                print(f"  [STATUS] {Tampilan.OKGREEN}BACKUP SUKSES{Tampilan.ENDC} : {pesan_sukses}")
+                pesan_notif = (
+                    f"✅ <b>Backup Database Sukses! (Lokal)</b>\n\n"
+                    f"<b>Server:</b> <code>{socket.gethostname()}</code> (<code>{socket.gethostbyname(socket.gethostname())}</code>)\n"
+                    f"<b>Waktu:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"<b>Durasi Proses:</b> {format_durasi(durasi)}\n"
+                    f"<b>Disimpan Lokal:</b> <code>{FOLDER_TUJUAN_LOKAL}</code>\n"
+                    f"<b>Di-upload ke GDrive:</b> {GDRIVE_FOLDER_ID if GDRIVE_FOLDER_ID else 'Tidak Aktif'}\n\n"
+                    f"<i>Data Anda aman dan mutakhir.</i>"
+                )
+                kirim_pesan_telegram(pesan_notif)
+            else:
+                pesan_gagal = "Silakan cek log di atas untuk detail error."
+                print(f"  [STATUS] {Tampilan.FAIL}BACKUP GAGAL{Tampilan.ENDC} : {pesan_gagal}")
+                pesan_notif = (
+                    f"❌ <b>Backup Database GAGAL! (Lokal)</b>\n\n"
+                    f"<b>Server:</b> <code>{socket.gethostname()}</code> (<code>{socket.gethostbyname(socket.gethostname())}</code>)\n"
                     f"<b>Waktu:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                     f"<b>Durasi Proses:</b> {format_durasi(durasi)}\n"
                     f"\n"
@@ -587,23 +663,30 @@ if __name__ == "__main__":
             print(f"  [DETAIL] Total durasi proses: {format_durasi(durasi)}")
         else:
             print(f"{Tampilan.FAIL}Perintah '{command}' tidak dikenal.{Tampilan.ENDC}")
-            print("Penggunaan: python TukangBackup.pykit [status|config|test-gdrive|test-tele|tele [on|off]|backup|help]")
+            print("Penggunaan: python TukangBackup.pykit [status|config|test-gdrive|test-tele|tele [on|off]|ssh-backup|lokal-backup|help]")
         sys.exit(0)
 
-    # Jika tidak ada argumen (default jalankan proses backup)
     clear_screen()
     tampilkan_banner()
+    print(f"{Tampilan.BOLD}[MEMULAI PROSES BACKUP (Default Mode: {DEFAULT_BACKUP_MODE.upper()})]{Tampilan.ENDC}")
     waktu_mulai = time.time()
-    sukses = buat_backup_remote_db()
+    sukses = jalankan_proses_backup(DEFAULT_BACKUP_MODE)
     waktu_selesai = time.time()
     durasi = waktu_selesai - waktu_mulai
-    print("")
     if sukses:
         pesan_sukses = f"Backup sukses tersimpan di folder: {FOLDER_TUJUAN_LOKAL}"
         print(f"  [STATUS] {Tampilan.OKGREEN}BACKUP SUKSES{Tampilan.ENDC} : {pesan_sukses}")
+        
+        if DEFAULT_BACKUP_MODE == 'lokal':
+            notif_server_info = f"<b>Server:</b> <code>{socket.gethostname()}</code> (<code>{socket.gethostbyname(socket.gethostname())}</code>)\n"
+            notif_mode_info = " (Lokal)"
+        else:
+            notif_server_info = f"<b>Server:</b> <code>{NAMA_SERVER_SSH}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
+            notif_mode_info = ""
+
         pesan_notif = (
-            f"✅ <b>Backup Database Sukses!</b>\n\n"
-            f"<b>Server:</b> <code>{NAMA_SERVER}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
+            f"✅ <b>Backup Database Sukses!{notif_mode_info}</b>\n\n"
+            f"{notif_server_info}"
             f"<b>Waktu:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"<b>Durasi Proses:</b> {format_durasi(durasi)}\n"
             f"<b>Disimpan Lokal:</b> <code>{FOLDER_TUJUAN_LOKAL}</code>\n"
@@ -614,9 +697,17 @@ if __name__ == "__main__":
     else:
         pesan_gagal = "Silakan cek log di atas untuk detail error."
         print(f"  [STATUS] {Tampilan.FAIL}BACKUP GAGAL{Tampilan.ENDC} : {pesan_gagal}")
+
+        if DEFAULT_BACKUP_MODE == 'lokal':
+            notif_server_info = f"<b>Server:</b> <code>{socket.gethostname()}</code> (<code>{socket.gethostbyname(socket.gethostname())}</code>)\n"
+            notif_mode_info = " (Lokal)"
+        else:
+            notif_server_info = f"<b>Server:</b> <code>{NAMA_SERVER_SSH}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
+            notif_mode_info = ""
+            
         pesan_notif = (
-            f"❌ <b>Backup Database GAGAL!</b>\n\n"
-            f"<b>Server:</b> <code>{NAMA_SERVER}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
+            f"❌ <b>Backup Database GAGAL!{notif_mode_info}</b>\n\n"
+            f"{notif_server_info}"
             f"<b>Waktu:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"<b>Durasi Proses:</b> {format_durasi(durasi)}\n"
             f"\n"
