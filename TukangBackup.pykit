@@ -435,7 +435,6 @@ def upload_ke_gdrive(file_path):
 
 # Fungsi inti yang kini mendukung mode SSH dan Lokal
 def jalankan_proses_backup(mode):
-    """Fungsi inti untuk menjalankan seluruh proses backup (SSH atau lokal)."""
     waktu_backup_terakhir = get_last_backup_time()
     print(f"{Tampilan.BOLD}[DETAIL PROSES]{Tampilan.ENDC}")
     print(f"  - Waktu           : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -462,7 +461,7 @@ def jalankan_proses_backup(mode):
     try:
         if not os.path.exists(FOLDER_TUJUAN_LOKAL):
             os.makedirs(FOLDER_TUJUAN_LOKAL, exist_ok=True)
-            print(f"  [STATUS] Folder tujuan lokal dibuat: {FOLDER_TUJUAN_LOKAL}")
+            print(f"  [STATUS] Folder tujuan dibuat: {FOLDER_TUJUAN_LOKAL}")
 
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         nama_file_sql = f"backup_database_{timestamp}.sql"
@@ -501,11 +500,13 @@ def jalankan_proses_backup(mode):
         print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Kompresi ke .tar.gz selesai.")
 
         upload_berhasil = upload_ke_gdrive(path_file_targz)
-        if upload_berhasil:
-            print(f"  [STATUS] Menghapus file backup lokal '{os.path.basename(path_file_targz)}' setelah upload GDrive...")
-            os.remove(path_file_targz)
+        
+        if upload_berhasil and GDRIVE_FOLDER_ID:
+            print(f"  [STATUS] File backup '{os.path.basename(path_file_targz)}' berhasil diupload ke GDrive dan tetap disimpan di '{FOLDER_TUJUAN_LOKAL}'.")
+        elif not upload_berhasil and GDRIVE_FOLDER_ID:
+            print(f"  {Tampilan.WARNING}[INFO]{Tampilan.ENDC} Upload ke GDrive gagal. File '{os.path.basename(path_file_targz)}' tetap ada di '{FOLDER_TUJUAN_LOKAL}'.")
         else:
-            print(f"  {Tampilan.WARNING}[INFO]{Tampilan.ENDC} File '{os.path.basename(path_file_targz)}' tetap ada di lokal karena upload GDrive gagal.")
+            print(f"  [STATUS] File backup '{os.path.basename(path_file_targz)}' disimpan di '{FOLDER_TUJUAN_LOKAL}'.")
 
         bersihkan_backup_lama()
         update_last_backup_time()
