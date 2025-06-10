@@ -558,7 +558,6 @@ if __name__ == "__main__":
             sukses = buat_backup_remote_db()
             waktu_selesai = time.time()
             durasi = waktu_selesai - waktu_mulai
-            print("")
             if sukses:
                 pesan_sukses = f"Backup sukses tersimpan di folder: {FOLDER_TUJUAN_LOKAL}"
                 print(f"  [STATUS] {Tampilan.OKGREEN}BACKUP SUKSES{Tampilan.ENDC} : {pesan_sukses}")
