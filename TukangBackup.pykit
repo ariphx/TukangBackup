@@ -594,7 +594,6 @@ if __name__ == "__main__":
     # Jika tidak ada argumen (default jalankan proses backup)
     clear_screen()
     tampilkan_banner()
-    print(f"{Tampilan.BOLD}[MEMULAI PROSES BACKUP (Default)] {Tampilan.ENDC}")
     waktu_mulai = time.time()
     sukses = buat_backup_remote_db()
     waktu_selesai = time.time()
