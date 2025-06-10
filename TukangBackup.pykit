@@ -1,0 +1,629 @@
+import os
+import subprocess
+import datetime
+import tarfile
+import shlex
+import sys
+import configparser
+import time
+import requests
+
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+
+class Tampilan:
+    OKGREEN = '\033[92m'
+    OKCYAN = '\033[96m'
+    FAIL = '\033[91m'
+    WARNING = '\033[1;93m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+
+config = configparser.ConfigParser()
+config_file = 'config.ini'
+STATUS_FILE = '.tukangbackup_status'
+LOG_FILE = 'backup.log'
+SHOULD_CLEAR_SCREEN_ONCE = True
+
+if not os.path.exists(config_file):
+    print(f"{Tampilan.FAIL}[FATAL ERROR]{Tampilan.ENDC} File konfigurasi '{config_file}' tidak ditemukan!")
+    sys.exit(1)
+
+try:
+    config.read(config_file)
+    NAMA_SERVER = config['SSH']['server_name']
+    NAMA_USER_SSH = config['SSH']['user']
+    ALAMAT_IP_SERVER = config['SSH']['server_ip']
+    NAMA_USER_DB = config['DATABASE']['user']
+    PASSWORD_DB = config['DATABASE']['password']
+    DB_HOST = config.get('DATABASE', 'host', fallback='localhost')
+    FOLDER_TUJUAN_LOKAL = config['LOCAL']['destination_folder']
+    HAPUS_BACKUP_LAMA_HARI = config.getint('LOCAL', 'cleanup_after_days')
+    GDRIVE_FOLDER_ID = config.get('GDRIVE', 'destination_folder_id', fallback='')
+    GDRIVE_AUTH_METHOD = config.get('GDRIVE', 'auth_method', fallback='oauth_desktop').lower()
+
+    TELEGRAM_BOT_TOKEN = config.get('TELEGRAM', 'telegram_bot_token', fallback='')
+    TELEGRAM_CHAT_ID = config.get('TELEGRAM', 'telegram_chat_id', fallback='')
+    SEND_TELEGRAM_NOTIFICATION = config.getboolean('TELEGRAM', 'send_telegram_notification', fallback=False)
+
+    if not os.path.isabs(FOLDER_TUJUAN_LOKAL):
+        print(f"{Tampilan.WARNING}[WARNING]{Tampilan.ENDC} 'destination_folder' di [LOCAL] harus berupa path absolut. Menggunakan path relatif dari direktori skrip.")
+        FOLDER_TUJUAN_LOKAL = os.path.abspath(FOLDER_TUJUAN_LOKAL)
+
+    if HAPUS_BACKUP_LAMA_HARI < 0:
+        print(f"{Tampilan.WARNING}[WARNING]{Tampilan.ENDC} 'cleanup_after_days' di [LOCAL] harus angka positif. Diset ke 0 (tidak ada penghapusan otomatis).")
+        HAPUS_BACKUP_LAMA_HARI = 0
+
+except KeyError as e:
+    print(f"{Tampilan.FAIL}[FATAL ERROR]{Tampilan.ENDC} Opsi konfigurasi hilang di '{config_file}': {e}. Pastikan semua kunci yang dibutuhkan ada.")
+    sys.exit(1)
+except ValueError as e:
+    print(f"{Tampilan.FAIL}[FATAL ERROR]{Tampilan.ENDC} Kesalahan nilai konfigurasi di '{config_file}': {e}. Pastikan 'cleanup_after_days' adalah angka.")
+    sys.exit(1)
+except configparser.Error as e:
+    print(f"{Tampilan.FAIL}[FATAL ERROR]{Tampilan.ENDC} Error saat membaca file konfigurasi '{config_file}': {e}")
+    sys.exit(1)
+
+def clear_screen():
+    """Membersihkan layar terminal hanya sekali di awal eksekusi utama."""
+    global SHOULD_CLEAR_SCREEN_ONCE
+    if SHOULD_CLEAR_SCREEN_ONCE:
+        os.system('cls' if os.name == 'nt' else 'clear')
+        SHOULD_CLEAR_SCREEN_ONCE = False
+
+def tampilkan_banner():
+    """Menampilkan banner ASCII Art."""
+    banner = r"""
+    ____ <==> ____
+    \___\(**)/___/            TukangBackup.pykit
+     \___|  |___/     auto backup all database via login ssh
+         L  J                     
+         |__|              https://github.com/ariphx/
+          vv
+    """
+    print(f"{Tampilan.BOLD}{banner}{Tampilan.ENDC}")
+
+def format_durasi(detik):
+    """Mengubah detik menjadi format menit dan detik yang mudah dibaca."""
+    if detik < 60: return f"{int(detik)} detik"
+    menit, sisa_detik = divmod(detik, 60)
+    return f"{int(menit)} menit {int(sisa_detik)} detik"
+
+def update_last_backup_time():
+    """Menulis timestamp saat ini ke file status."""
+    timestamp_sekarang = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        with open(STATUS_FILE, 'w') as f:
+            f.write(timestamp_sekarang)
+    except IOError as e:
+        print(f"  {Tampilan.WARNING}[WARNING]{Tampilan.ENDC} Gagal memperbarui status backup terakhir: {e}")
+
+def get_last_backup_time():
+    """Membaca timestamp dari file status."""
+    try:
+        if os.path.exists(STATUS_FILE):
+            with open(STATUS_FILE, 'r') as f:
+                return f.read().strip()
+        else:
+            return "Belum pernah ada backup sukses."
+    except IOError as e:
+        return f"Gagal membaca file status: {e}"
+
+def get_last_run_status():
+    """Membaca status terakhir (SUKSES/GAGAL) dari file log."""
+    if not os.path.exists(LOG_FILE):
+        return (f"Log file ('{LOG_FILE}') belum ada.", Tampilan.WARNING)
+    try:
+        with open(LOG_FILE, 'r') as f:
+            lines = f.readlines()
+        for line in reversed(lines):
+            if "BACKUP SUKSES" in line: return ("SUKSES", Tampilan.OKGREEN)
+            elif "BACKUP GAGAL" in line: return ("GAGAL", Tampilan.FAIL)
+    except IOError as e:
+        return (f"Tidak bisa membaca file log '{LOG_FILE}': {e}", Tampilan.WARNING)
+    return ("Belum ada log status yang jelas.", Tampilan.WARNING)
+
+def kirim_pesan_telegram(pesan):
+    """Mengirim pesan ke Telegram menggunakan Bot API."""
+    if not SEND_TELEGRAM_NOTIFICATION or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': pesan,
+        'parse_mode': 'HTML'
+    }
+    try:
+        respons = requests.post(api_url, data=payload)
+        respons.raise_for_status()
+        print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Notifikasi Telegram terkirim.")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Gagal mengirim notifikasi Telegram: {e}")
+        return False
+
+def toggle_telegram_notification(state=None):
+    """Mengaktifkan/menonaktifkan notifikasi Telegram atau menampilkan statusnya."""
+    global SEND_TELEGRAM_NOTIFICATION
+
+    if not os.path.exists(config_file):
+        print(f"{Tampilan.FAIL}[ERROR]{Tampilan.ENDC} File konfigurasi '{config_file}' tidak ditemukan.")
+        return
+
+    if 'TELEGRAM' not in config:
+        config['TELEGRAM'] = {}
+
+    current_status = config.getboolean('TELEGRAM', 'send_telegram_notification', fallback=False)
+
+    if state is None:
+        status_text = f"{Tampilan.OKGREEN}AKTIF{Tampilan.ENDC}" if current_status else f"{Tampilan.FAIL}TIDAK AKTIF{Tampilan.ENDC}"
+        print(f"\n{Tampilan.BOLD}[Status Notifikasi Telegram]{Tampilan.ENDC}")
+        print(f"Status saat ini: {status_text}")
+        print("Gunakan 'python TukangBackup.pykit tele [on|off]' untuk mengubah status.")
+    else:
+        new_status = state.lower() == 'on'
+        if current_status == new_status:
+            print(f"Notifikasi Telegram sudah {('AKTIF' if new_status else 'TIDAK AKTIF')}. Tidak ada perubahan.")
+        else:
+            config['TELEGRAM']['send_telegram_notification'] = 'yes' if new_status else 'no'
+            try:
+                with open(config_file, 'w') as cfgfile:
+                    config.write(cfgfile)
+                SEND_TELEGRAM_NOTIFICATION = new_status
+                print(f"{Tampilan.OKGREEN}[SUKSES]{Tampilan.ENDC} Notifikasi Telegram sekarang {('AKTIF' if new_status else 'TIDAK AKTIF')}.")
+            except IOError as e:
+                print(f"{Tampilan.FAIL}[ERROR]{Tampilan.ENDC} Gagal menyimpan perubahan ke '{config_file}': {e}")
+            except Exception as e:
+                print(f"{Tampilan.FAIL}[ERROR]{Tampilan.ENDC} Terjadi kesalahan saat mengubah status notifikasi: {e}")
+
+def gdrive_auth():
+    """Melakukan otentikasi ke Google Drive menggunakan OAuth 2.0 untuk aplikasi desktop."""
+    try:
+        client_secrets_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'client_secrets.json')
+        credentials_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'credentials.json')
+
+        settings = {
+            "client_config_backend": "file",
+            "client_secrets_file": client_secrets_file,
+            "oauth_scope": [
+                "https://www.googleapis.com/auth/drive",
+            ],
+            "save_credentials": True,
+            "save_credentials_file": credentials_file,
+            "save_credentials_backend": "file"
+        }
+
+        gauth = GoogleAuth(settings=settings)
+        gauth.LoadCredentialsFile(credentials_file)
+
+        if gauth.credentials is None:
+            print(f"\n{Tampilan.OKCYAN}[INFO]{Tampilan.ENDC} Token otentikasi Google Drive tidak ditemukan atau kedaluwarsa.")
+            print(f"  Silakan ikuti instruksi di browser untuk otentikasi.")
+            gauth.LocalWebserverAuth()
+        elif gauth.access_token_expired:
+            print(f"\n{Tampilan.OKCYAN}[INFO]{Tampilan.ENDC} Token otentikasi Google Drive kedaluwarsa. Mencoba refresh...")
+            gauth.Refresh()
+            if gauth.access_token_expired:
+                print(f"  Refresh token gagal. Silakan ikuti instruksi di browser untuk otentikasi ulang.")
+                gauth.LocalWebserverAuth()
+
+        print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Otentikasi Google Drive berhasil.")
+        return GoogleDrive(gauth)
+    except FileNotFoundError as e:
+        if "client_secrets.json" in str(e):
+            raise Exception(f"File 'client_secrets.json' tidak ditemukan. Pastikan Anda sudah mengunduhnya dari Google Cloud Console dan menamainya 'client_secrets.json'.")
+        else:
+            raise Exception(f"Gagal otentikasi PyDrive2: {e}. Periksa file kredensial.")
+    except Exception as e:
+        raise Exception(f"Gagal otentikasi PyDrive2: {e}. Periksa koneksi internet atau izin kredensial.")
+
+def show_status():
+    """Menampilkan ringkasan status."""
+    tampilkan_banner()
+    last_backup_time = get_last_backup_time()
+    last_status, status_color = get_last_run_status()
+    print(f"\n{Tampilan.BOLD}[TukangBackup Status Check]{Tampilan.ENDC}")
+    print("-" * 45)
+    print(f"  - Lokasi Backup   : {FOLDER_TUJUAN_LOKAL}")
+    print(f"  - Backup Terakhir : {last_backup_time}")
+    print(f"  - Status Terakhir : {status_color}{last_status}{Tampilan.ENDC}")
+    print("-" * 45)
+
+def show_config():
+    """Menampilkan konfigurasi saat ini."""
+    tampilkan_banner()
+    print(f"\n{Tampilan.BOLD}[TukangBackup Current Configuration]{Tampilan.ENDC}")
+    print("-" * 45)
+    print(f"{Tampilan.BOLD}[SSH]{Tampilan.ENDC}")
+    print(f"  - server_name : {NAMA_SERVER}")
+    print(f"  - user        : {NAMA_USER_SSH}")
+    print(f"  - server_ip   : {ALAMAT_IP_SERVER}")
+    print(f"{Tampilan.BOLD}[DATABASE]{Tampilan.ENDC}")
+    print(f"  - user        : {NAMA_USER_DB}")
+    print(f"  - password    : {'*' * len(PASSWORD_DB) if PASSWORD_DB else '(kosong)'}")
+    print(f"  - host        : {DB_HOST if DB_HOST != 'localhost' else 'localhost (sama dengan server SSH)'}")
+    print(f"{Tampilan.BOLD}[LOCAL]{Tampilan.ENDC}")
+    print(f"  - destination : {FOLDER_TUJUAN_LOKAL}")
+    print(f"  - cleanup_days: {HAPUS_BACKUP_LAMA_HARI}")
+    print(f"{Tampilan.BOLD}[GDRIVE]{Tampilan.ENDC}")
+    print(f"  - folder_id   : {GDRIVE_FOLDER_ID if GDRIVE_FOLDER_ID else '(tidak diset, upload tidak aktif)'}")
+    print(f"  - auth_method : {GDRIVE_AUTH_METHOD}")
+    print(f"{Tampilan.BOLD}[TELEGRAM]{Tampilan.ENDC}")
+    print(f"  - bot_token   : {'*' * len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else '(kosong)'}")
+    print(f"  - chat_id     : {TELEGRAM_CHAT_ID if TELEGRAM_CHAT_ID else '(kosong)'}")
+    print(f"  - send_notif  : {'yes' if SEND_TELEGRAM_NOTIFICATION else 'no'}")
+    print("-" * 45)
+    print(f"Lokasi file config: {os.path.abspath(config_file)}")
+
+def show_help():
+    """Menampilkan informasi bantuan tentang tool dan penggunaannya."""
+    tampilkan_banner()
+    print(f"\n{Tampilan.BOLD}[TukangBackup.pykit - Bantuan & Penggunaan]{Tampilan.ENDC}")
+    print("\n---")
+    print(f"{Tampilan.BOLD}Deskripsi:{Tampilan.ENDC}")
+    print("  TukangBackup.pykit adalah skrip Python untuk otomatisasi backup")
+    print("  database MySQL/MariaDB dari server remote via SSH. Hasil backup")
+    print("  akan dikompresi, diunggah ke Google Drive, dan statusnya dikirim")
+    print("  melalui notifikasi Telegram.")
+    print("\n---")
+    print(f"{Tampilan.BOLD}Penggunaan:{Tampilan.ENDC}")
+    print(f"  {Tampilan.FAIL}python TukangBackup.pykit [COMMAND] [ARGUMEN]{Tampilan.ENDC}")
+    print("\n---")
+    print(f"{Tampilan.BOLD}Daftar COMMAND:{Tampilan.ENDC}")
+    print(f"  * {Tampilan.FAIL}backup{Tampilan.ENDC}")
+    print("    Menjalankan proses backup lengkap (unduh, kompres, upload).")
+    print("    (Ini juga command default jika dijalankan tanpa argumen.)")
+    print(f"  * {Tampilan.FAIL}status{Tampilan.ENDC}")
+    print("    Menampilkan ringkasan status backup terakhir.")
+    print(f"  * {Tampilan.FAIL}config{Tampilan.ENDC}")
+    print("    Menampilkan konfigurasi saat ini dari 'config.ini'.")
+    print(f"  * {Tampilan.FAIL}test-gdrive{Tampilan.ENDC}")
+    print("    Melakukan tes koneksi & otentikasi Google Drive (interaksi browser untuk pertama kali).")
+    print(f"  * {Tampilan.FAIL}test-tele{Tampilan.ENDC}")
+    print("    Mengirim pesan notifikasi percobaan ke Telegram.")
+    print(f"  * {Tampilan.FAIL}tele [on|off]{Tampilan.ENDC}")
+    print("    Mengaktifkan ('on') atau menonaktifkan ('off') notifikasi Telegram.")
+    print("    Contoh: `python TukangBackup.pykit tele on`")
+    print("    Lihat status: `python TukangBackup.pykit tele`")
+    print(f"  * {Tampilan.FAIL}help{Tampilan.ENDC}")
+    print("    Menampilkan pesan bantuan ini.")
+    print("\n---")
+    print(f"{Tampilan.BOLD}Catatan Penting:{Tampilan.ENDC}")
+    print("  Pastikan file 'config.ini' dan 'client_secrets.json' (untuk GDrive)")
+    print("  berada di direktori yang sama dengan skrip ini.")
+    print("\n---")
+    print(f"{Tampilan.BOLD}Troubleshooting Google Drive:{Tampilan.ENDC}")
+    print("  Jika Anda mengalami error Google Drive (misalnya, 'HttpError',")
+    print("  'token expired', atau masalah otentikasi):")
+    print(f"  1. Jalankan ulang {Tampilan.FAIL}python TukangBackup.pykit test-gdrive{Tampilan.ENDC}.")
+    print("     Ini akan memicu ulang proses otentikasi browser jika token")
+    print("     sudah kedaluwarsa atau ada masalah koneksi.")
+    print(f"  2. Pastikan file '{Tampilan.FAIL}client_secrets.json{Tampilan.ENDC}' sudah benar dan")
+    print("     berada di folder yang sama dengan skrip.")
+    print(f"  3. Pastikan {Tampilan.FAIL}GDRIVE_FOLDER_ID{Tampilan.ENDC} di 'config.ini' benar-benar")
+    print("     hanya berisi ID folder (misalnya, `1bFvBiosNkCvdAwjxuy7avjSBKGBgKW-N`),")
+    print("     tanpa komentar atau karakter tambahan.")
+    print(f"  4. Periksa izin akun Google Anda di Google Drive. Akun yang digunakan")
+    print("     harus memiliki izin 'Editor' atau 'Kontributor' pada folder tujuan.")
+    print(f"  5. Jika masalah berlanjut, hapus file '{Tampilan.FAIL}credentials.json{Tampilan.ENDC}'")
+    print("     di folder skrip Anda, lalu jalankan kembali `test-gdrive`.")
+    print("     Ini akan memaksa otentikasi ulang dari awal.")
+    print("\n---")
+    print(f"{Tampilan.BOLD}Otomatisasi dengan Cron Job (Linux/Unix):{Tampilan.ENDC}")
+    print("  Untuk menjalankan backup otomatis secara berkala menggunakan cron job:")
+    print(f"  1. Buka terminal dan ketik: {Tampilan.FAIL}crontab -e{Tampilan.ENDC}")
+    print("  2. Tambahkan baris baru di akhir file (sesuaikan dengan jadwal Anda):")
+    print(f"     {Tampilan.FAIL}0 3 * * * /usr/bin/python3 /path/to/TukangBackup.pykit backup >> /var/log/tukangbackup.log 2>&1{Tampilan.ENDC}")
+    print("\n  Penjelasan:")
+    print(f"  * {Tampilan.FAIL}0 3 * * *{Tampilan.ENDC} : Jadwal (di sini, setiap hari jam 3 pagi).")
+    print("    (menit jam hari_bulan bulan hari_minggu)")
+    print(f"  * {Tampilan.FAIL}/usr/bin/python3{Tampilan.ENDC} : Path lengkap ke interpreter Python Anda.")
+    print("    (Gunakan `which python3` untuk mencari path yang benar).")
+    print(f"  * {Tampilan.FAIL}/path/to/TukangBackup.pykit{Tampilan.ENDC} : Path lengkap ke skrip Anda.")
+    print("    (Misalnya, `/home/user/my_backup_project/TukangBackup.pykit`).")
+    print(f"  * {Tampilan.FAIL}backup{Tampilan.ENDC} : Memanggil command 'backup' secara eksplisit.")
+    print(f"  * {Tampilan.FAIL}>> /var/log/tukangbackup.log 2>&1{Tampilan.ENDC} : Mengarahkan output")
+    print("    dan error ke file log untuk debugging (disarankan).")
+    print("  3. Simpan dan keluar dari editor (biasanya Ctrl+X, Y, Enter untuk nano).")
+    print("---")
+
+def test_telegram_notification():
+    """Mengirim pesan notifikasi Telegram sebagai tes."""
+    tampilkan_banner()
+    print(f"\n{Tampilan.BOLD}[Tes Notifikasi Telegram]{Tampilan.ENDC}")
+    print("-" * 45)
+
+    if not SEND_TELEGRAM_NOTIFICATION:
+        print(f"  {Tampilan.WARNING}[INFO]{Tampilan.ENDC} Notifikasi Telegram saat ini dinonaktifkan di '{config_file}'.")
+        print("  Silakan aktifkan dulu dengan 'python TukangBackup.pykit tele on' untuk mengirim tes.")
+        print("-" * 45)
+        return
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"  {Tampilan.FAIL}[GAGAL]{Tampilan.ENDC} Konfigurasi Telegram (token atau chat ID) tidak lengkap di '{config_file}'.")
+        print("  Mohon periksa bagian [TELEGRAM] di file konfigurasi Anda.")
+        print("-" * 45)
+        return
+
+    pesan_tes = (
+        f"✨ <b>TukangBackupBot Status</b>\n\n"
+        f"✅ <i>Tes Notifikasi Berhasil</i>\n"
+        f"Server: <code>{NAMA_SERVER}</code>\n"
+        f"Waktu: {datetime.datetime.now().strftime('%H:%M:%S, %d %b %Y')}"
+    )
+
+    print("  -> Mencoba mengirim pesan tes ke Telegram...")
+    kirim_berhasil = kirim_pesan_telegram(pesan_tes)
+
+    if kirim_berhasil:
+        print(f"\n{Tampilan.OKGREEN}Tes notifikasi Telegram BERHASIL!{Tampilan.ENDC}")
+        print("Periksa aplikasi Telegram Anda.")
+    else:
+        print(f"\n{Tampilan.FAIL}Tes notifikasi Telegram GAGAL. Silakan periksa log di atas.{Tampilan.ENDC}")
+        print("Pastikan token bot dan chat ID di config.ini sudah benar dan bot sudah pernah Anda mulai obrolan.")
+    print("-" * 45)
+
+def run_gdrive_test():
+    """Menjalankan tes koneksi dan otentikasi ke Google Drive."""
+    tampilkan_banner()
+    print(f"\n{Tampilan.BOLD}[Tes Koneksi Google Drive]{Tampilan.ENDC}")
+    print("-" * 45)
+    try:
+        print("  -> Mencoba otentikasi ke Google Drive...")
+        drive = gdrive_auth()
+        print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Otentikasi Google Drive berhasil.")
+
+        if not GDRIVE_FOLDER_ID:
+            print(f"  {Tampilan.WARNING}[INFO]{Tampilan.ENDC} ID Folder GDrive tidak diset di konfigurasi. Tes hanya sampai otentikasi.")
+        else:
+            print(f"  -> Mencoba melihat folder GDrive (ID: {GDRIVE_FOLDER_ID[:15]}...)...")
+            folder = drive.CreateFile({'id': GDRIVE_FOLDER_ID})
+            folder.FetchMetadata(fields='title')
+            print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Berhasil terhubung ke folder '{Tampilan.OKGREEN}{folder['title']}{Tampilan.ENDC}'.")
+
+        print("-" * 45)
+        print(f"{Tampilan.OKGREEN}Koneksi ke Google Drive terlihat baik dan siap digunakan!{Tampilan.ENDC}")
+    except Exception as e:
+        print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Tes koneksi Gagal: {e}")
+        print("-" * 45)
+        print(f"{Tampilan.FAIL}Koneksi ke Google Drive GAGAL. Pastikan 'client_secrets.json' benar, dan Anda sudah melakukan otentikasi browser.{Tampilan.ENDC}")
+
+
+def upload_ke_gdrive(file_path):
+    """Mengupload file ke folder spesifik di Google Drive."""
+    if not GDRIVE_FOLDER_ID:
+        print(f"  {Tampilan.WARNING}[SKIP]{Tampilan.ENDC} Upload ke Google Drive dilewati karena 'GDRIVE_FOLDER_ID' tidak diset.")
+        return True
+    try:
+        print(f"  [STATUS] Melakukan otentikasi ke Google Drive...")
+        drive = gdrive_auth()
+        print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Otentikasi Google Drive berhasil.")
+
+        file_name = os.path.basename(file_path)
+        print(f"  [STATUS] Mengupload file '{file_name}' ke Google Drive...")
+        metadata = {
+            'title': file_name,
+            'parents': [{'id': GDRIVE_FOLDER_ID, 'kind': 'drive#fileLink'}]
+        }
+        gfile = drive.CreateFile(metadata)
+        gfile.SetContentFile(file_path)
+        gfile.Upload()
+        print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} File berhasil diupload ke Google Drive.")
+        return True
+    except Exception as e:
+        print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Gagal upload ke Google Drive: {e}")
+        return False
+
+def buat_backup_remote_db():
+    """Fungsi inti untuk menjalankan seluruh proses backup."""
+    waktu_backup_terakhir = get_last_backup_time()
+    print(f"{Tampilan.BOLD}[DETAIL PROSES]{Tampilan.ENDC}")
+    print(f"  - Waktu           : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  - Server          : {NAMA_SERVER} [{ALAMAT_IP_SERVER}]")
+    print(f"  - Tujuan Lokal    : {FOLDER_TUJUAN_LOKAL}")
+    print(f"  - Tujuan GDrive   : {GDRIVE_FOLDER_ID if GDRIVE_FOLDER_ID else 'Tidak Aktif'}")
+    print(f"  - Backup Terakhir : {waktu_backup_terakhir}")
+    print(f"\n{Tampilan.BOLD}[LOG EKSEKUSI]{Tampilan.ENDC}")
+
+    path_file_sql_lokal = ""
+    path_file_targz = ""
+
+    try:
+        if not os.path.exists(FOLDER_TUJUAN_LOKAL):
+            os.makedirs(FOLDER_TUJUAN_LOKAL, exist_ok=True)
+            print(f"  [STATUS] Folder tujuan lokal dibuat: {FOLDER_TUJUAN_LOKAL}")
+
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        nama_file_sql = f"backup_database_{timestamp}.sql"
+        path_file_sql_lokal = os.path.join(FOLDER_TUJUAN_LOKAL, nama_file_sql)
+
+        host_option = f" -h {shlex.quote(DB_HOST)}" if DB_HOST and DB_HOST != 'localhost' else ""
+        perintah_dump = (
+            f"MYSQL_PWD={shlex.quote(PASSWORD_DB)} mysqldump -u {shlex.quote(NAMA_USER_DB)}{host_option} "
+            f"--all-databases --routines --events --triggers --no-tablespaces"
+        )
+        perintah_ssh_full = ["ssh", f"{NAMA_USER_SSH}@{ALAMAT_IP_SERVER}", perintah_dump]
+
+        print(f"  [STATUS] Menjalankan mysqldump dari remote server...")
+        with open(path_file_sql_lokal, "wb") as file_output:
+            proses = subprocess.Popen(perintah_ssh_full, stdout=file_output, stderr=subprocess.PIPE, shell=False)
+            stderr_output = proses.communicate()[1]
+
+            if proses.returncode != 0:
+                pesan_error = stderr_output.decode('utf-8', errors='ignore').strip()
+                print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Mysqldump gagal: {pesan_error}")
+                if os.path.exists(path_file_sql_lokal):
+                    os.remove(path_file_sql_lokal)
+                return False
+        print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Backup database (.sql) berhasil diunduh ke lokal.")
+
+        path_file_targz = path_file_sql_lokal.replace(".sql", ".tar.gz")
+        print(f"  [STATUS] Mengompres file SQL ke {os.path.basename(path_file_targz)}...")
+        with tarfile.open(path_file_targz, 'w:gz') as tar:
+            tar.add(path_file_sql_lokal, arcname=os.path.basename(path_file_sql_lokal))
+        os.remove(path_file_sql_lokal)
+        print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Kompresi ke .tar.gz selesai.")
+
+        upload_berhasil = upload_ke_gdrive(path_file_targz)
+        if upload_berhasil:
+            print(f"  [STATUS] Menghapus file backup lokal '{os.path.basename(path_file_targz)}' setelah upload GDrive...")
+            os.remove(path_file_targz)
+        else:
+            print(f"  {Tampilan.WARNING}[INFO]{Tampilan.ENDC} File '{os.path.basename(path_file_targz)}' tetap ada di lokal karena upload GDrive gagal.")
+
+        bersihkan_backup_lama()
+        update_last_backup_time()
+        return True
+
+    except FileNotFoundError as e:
+        print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Perintah tidak ditemukan: {e}. Pastikan 'ssh' atau 'mysqldump' (jika diakses lokal) terinstal dan ada di PATH.")
+        if os.path.exists(path_file_sql_lokal): os.remove(path_file_sql_lokal)
+        if os.path.exists(path_file_targz): os.remove(path_file_targz)
+        return False
+    except subprocess.CalledProcessError as e:
+        print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Perintah eksternal gagal dengan kode {e.returncode}: {e.stderr.decode('utf-8', errors='ignore')}")
+        if os.path.exists(path_file_sql_lokal): os.remove(path_file_sql_lokal)
+        if os.path.exists(path_file_targz): os.remove(path_file_targz)
+        return False
+    except tarfile.TarError as e:
+        print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Gagal mengompres file: {e}")
+        if os.path.exists(path_file_sql_lokal): os.remove(path_file_sql_lokal)
+        if os.path.exists(path_file_targz): os.remove(path_file_targz)
+        return False
+    except Exception as e:
+        print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Terjadi error tidak terduga selama proses backup: {e}")
+        if os.path.exists(path_file_sql_lokal): os.remove(path_file_sql_lokal)
+        if os.path.exists(path_file_targz): os.remove(path_file_targz)
+        return False
+
+def bersihkan_backup_lama():
+    """Menghapus file backup lokal yang lebih tua dari HAPUS_BACKUP_LAMA_HARI."""
+    if HAPUS_BACKUP_LAMA_HARI <= 0:
+        print("  [STATUS] Pengaturan pembersihan backup lokal dinonaktifkan (cleanup_after_days <= 0).")
+        return
+
+    print(f"  [STATUS] Mengecek backup lokal lama (lebih dari {HAPUS_BACKUP_LAMA_HARI} hari) di '{FOLDER_TUJUAN_LOKAL}'...")
+    waktu_limit = datetime.datetime.now() - datetime.timedelta(days=HAPUS_BACKUP_LAMA_HARI)
+    file_dihapus = []
+    try:
+        for nama_file in os.listdir(FOLDER_TUJUAN_LOKAL):
+            path_file = os.path.join(FOLDER_TUJUAN_LOKAL, nama_file)
+            if os.path.isfile(path_file) and nama_file.endswith(".tar.gz"):
+                file_creation_time = datetime.datetime.fromtimestamp(os.path.getmtime(path_file))
+                if file_creation_time < waktu_limit:
+                    os.remove(path_file)
+                    file_dihapus.append(nama_file)
+    except OSError as e:
+        print(f"  {Tampilan.FAIL}[FAILED]{Tampilan.ENDC} Gagal mengakses atau menghapus file di '{FOLDER_TUJUAN_LOKAL}': {e}")
+        return
+
+    if file_dihapus:
+        print(f"  {Tampilan.OKGREEN}[SUCCES]{Tampilan.ENDC} Total {len(file_dihapus)} file lama berhasil dihapus.")
+        for f in file_dihapus:
+            print(f"    - Dihapus: {f}")
+    else:
+        print("  [STATUS] Tidak ada backup lama untuk dihapus.")
+
+if __name__ == "__main__":
+    if sys.platform == "win32":
+        os.system('color')
+
+    if len(sys.argv) > 1:
+        command = sys.argv[1].lower()
+        if command == 'status':
+            show_status()
+        elif command == 'config':
+            show_config()
+        elif command == 'test-gdrive':
+            run_gdrive_test()
+        elif command == 'test-tele':
+            test_telegram_notification()
+        elif command == 'tele':
+            if len(sys.argv) > 2:
+                sub_command = sys.argv[2].lower()
+                if sub_command in ['on', 'off']:
+                    toggle_telegram_notification(sub_command)
+                else:
+                    print(f"{Tampilan.FAIL}Argumen tidak valid untuk 'tele'. Gunakan 'on' atau 'off'.{Tampilan.ENDC}")
+            else:
+                toggle_telegram_notification()
+        elif command == 'help':
+            show_help()
+        elif command == 'backup':
+            clear_screen()
+            tampilkan_banner()
+            print(f"{Tampilan.BOLD}[MEMULAI PROSES BACKUP]{Tampilan.ENDC}")
+            waktu_mulai = time.time()
+            sukses = buat_backup_remote_db()
+            waktu_selesai = time.time()
+            durasi = waktu_selesai - waktu_mulai
+            print("")
+            if sukses:
+                pesan_sukses = f"Backup sukses tersimpan di folder: {FOLDER_TUJUAN_LOKAL}"
+                print(f"  [STATUS] {Tampilan.OKGREEN}BACKUP SUKSES{Tampilan.ENDC} : {pesan_sukses}")
+                pesan_notif = (
+                    f"✅ <b>Backup Database Sukses!</b>\n\n"
+                    f"<b>Server:</b> <code>{NAMA_SERVER}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
+                    f"<b>Waktu:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"<b>Durasi Proses:</b> {format_durasi(durasi)}\n"
+                    f"<b>Disimpan Lokal:</b> <code>{FOLDER_TUJUAN_LOKAL}</code>\n"
+                    f"<b>Di-upload ke GDrive:</b> {GDRIVE_FOLDER_ID if GDRIVE_FOLDER_ID else 'Tidak Aktif'}\n\n"
+                    f"<i>Data Anda aman dan mutakhir.</i>"
+                )
+                kirim_pesan_telegram(pesan_notif)
+            else:
+                pesan_gagal = "Silakan cek log di atas untuk detail error."
+                print(f"  [STATUS] {Tampilan.FAIL}BACKUP GAGAL{Tampilan.ENDC} : {pesan_gagal}")
+                pesan_notif = (
+                    f"❌ <b>Backup Database GAGAL!</b>\n\n"
+                    f"<b>Server:</b> <code>{NAMA_SERVER}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
+                    f"<b>Waktu:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"<b>Durasi Proses:</b> {format_durasi(durasi)}\n"
+                    f"\n"
+                    f"❗️ <b>Pesan Error:</b> Mohon cek log di server untuk detail lebih lanjut.\n"
+                    f"<i>Tindakan segera diperlukan.</i>"
+                )
+                kirim_pesan_telegram(pesan_notif)
+            print(f"  [DETAIL] Total durasi proses: {format_durasi(durasi)}")
+        else:
+            print(f"{Tampilan.FAIL}Perintah '{command}' tidak dikenal.{Tampilan.ENDC}")
+            print("Penggunaan: python TukangBackup.pykit [status|config|test-gdrive|test-tele|tele [on|off]|backup|help]")
+        sys.exit(0)
+
+    # Jika tidak ada argumen (default jalankan proses backup)
+    clear_screen()
+    tampilkan_banner()
+    print(f"{Tampilan.BOLD}[MEMULAI PROSES BACKUP (Default)] {Tampilan.ENDC}")
+    waktu_mulai = time.time()
+    sukses = buat_backup_remote_db()
+    waktu_selesai = time.time()
+    durasi = waktu_selesai - waktu_mulai
+    print("")
+    if sukses:
+        pesan_sukses = f"Backup sukses tersimpan di folder: {FOLDER_TUJUAN_LOKAL}"
+        print(f"  [STATUS] {Tampilan.OKGREEN}BACKUP SUKSES{Tampilan.ENDC} : {pesan_sukses}")
+        pesan_notif = (
+            f"✅ <b>Backup Database Sukses!</b>\n\n"
+            f"<b>Server:</b> <code>{NAMA_SERVER}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
+            f"<b>Waktu:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"<b>Durasi Proses:</b> {format_durasi(durasi)}\n"
+            f"<b>Disimpan Lokal:</b> <code>{FOLDER_TUJUAN_LOKAL}</code>\n"
+            f"<b>Di-upload ke GDrive:</b> {GDRIVE_FOLDER_ID if GDRIVE_FOLDER_ID else 'Tidak Aktif'}\n\n"
+            f"<i>Data Anda aman dan mutakhir.</i>"
+        )
+        kirim_pesan_telegram(pesan_notif)
+    else:
+        pesan_gagal = "Silakan cek log di atas untuk detail error."
+        print(f"  [STATUS] {Tampilan.FAIL}BACKUP GAGAL{Tampilan.ENDC} : {pesan_gagal}")
+        pesan_notif = (
+            f"❌ <b>Backup Database GAGAL!</b>\n\n"
+            f"<b>Server:</b> <code>{NAMA_SERVER}</code> (<code>{ALAMAT_IP_SERVER}</code>)\n"
+            f"<b>Waktu:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"<b>Durasi Proses:</b> {format_durasi(durasi)}\n"
+            f"\n"
+            f"❗️ <b>Pesan Error:</b> Mohon cek log di server untuk detail lebih lanjut.\n"
+            f"<i>Tindakan segera diperlukan.</i>"
+        )
+        kirim_pesan_telegram(pesan_notif)
+    print(f"  [DETAIL] Total durasi proses: {format_durasi(durasi)}")
