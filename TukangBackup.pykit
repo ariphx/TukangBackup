@@ -591,7 +591,6 @@ if __name__ == "__main__":
         elif command == 'ssh-backup': # Command untuk SSH backup
             clear_screen()
             tampilkan_banner()
-            print(f"{Tampilan.BOLD}[MEMULAI PROSES BACKUP (SSH)]{Tampilan.ENDC}")
             waktu_mulai = time.time()
             sukses = jalankan_proses_backup('ssh')
             waktu_selesai = time.time()
@@ -668,7 +667,6 @@ if __name__ == "__main__":
 
     clear_screen()
     tampilkan_banner()
-    print(f"{Tampilan.BOLD}[MEMULAI PROSES BACKUP (Default Mode: {DEFAULT_BACKUP_MODE.upper()})]{Tampilan.ENDC}")
     waktu_mulai = time.time()
     sukses = jalankan_proses_backup(DEFAULT_BACKUP_MODE)
     waktu_selesai = time.time()
