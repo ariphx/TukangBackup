@@ -1,25 +1,26 @@
 # TukangBackup.pykit
 
 <pre>
-   ____ <==> ____
-   \___\(**)/___/          TukangBackup.pykit
-    \___|  |___/   auto backup all database via login ssh
-        L  J
-        |__|           https://github.com/ariphx/
-         vv
+    ____ <==> ____
+    \___\(**)/___/          TukangBackup.pykit
+     \___|  |___/   multi-mode auto backup all database
+         L  J
+         |__|           https://github.com/ariphx/
+          vv
 </pre>
 
-Sebuah alat backup database MySQL/MariaDB otomatis via SSH yang **simpel, andal, dan mudah dikonfigurasi**. Dibuat dengan Python, dilengkapi notifikasi Telegram dan upload ke Google Drive.
+A **multi-mode auto backup all database** solution for MySQL/MariaDB. This Python script offers flexible backup options from **remote servers via SSH** or **directly from the local server**. It includes seamless Google Drive integration and Telegram notifications for peace of mind.
 
 ---
 
 ## ✨ Fitur Utama
 
+* **Backup Multi-Mode**: Lakukan backup dari **server remote via SSH** atau **langsung dari server lokal** tempat skrip berjalan.
 * **Backup Otomatis Komprehensif**: Melakukan `mysqldump --all-databases` termasuk *routines*, *events*, dan *triggers*.
-* **Koneksi Aman SSH**: Menggunakan SSH untuk akses remote ke database.
+* **Koneksi Aman SSH**: Menggunakan SSH untuk akses remote ke database (untuk mode `ssh-backup`).
 * **Konfigurasi Fleksibel**: Semua pengaturan dikelola terpisah di `config.ini`.
 * **Kompresi `.tar.gz`**: Menghemat ruang penyimpanan.
-* **Pembersihan Otomatis**: Menghapus backup lama di lokal berdasarkan hari yang dikonfigurasi.
+* **Pembersihan Otomatis**: Menghapus backup lama di lokal berdasarkan durasi yang dikonfigurasi.
 * **Integrasi Google Drive**: Unggah otomatis file backup ke folder Google Drive Anda.
 * **Notifikasi Telegram**: Dapatkan notifikasi status backup (sukses/gagal) langsung ke Telegram Anda.
 * **Manajemen Mudah**: Dilengkapi dengan berbagai *command* untuk status, konfigurasi, tes GDrive, dan kontrol notifikasi Telegram.
@@ -30,9 +31,10 @@ Sebuah alat backup database MySQL/MariaDB otomatis via SSH yang **simpel, andal,
 
 * **Python 3.x**
 * **Di PC/Server yang menjalankan script:**
-    * OpenSSH Client
+    * MySQL/MariaDB Client Tools (`mysqldump`)
+    * *Untuk mode `ssh-backup`*: OpenSSH Client
 * **Di Server Database (Remote):**
-    * OpenSSH Server
+    * *Untuk mode `ssh-backup`*: OpenSSH Server
     * MySQL/MariaDB Client Tools (`mysqldump`)
 
 ---
@@ -64,9 +66,10 @@ Sebuah alat backup database MySQL/MariaDB otomatis via SSH yang **simpel, andal,
         cp config.ini.example config.ini
         ```
     * Buka `config.ini` dan **isi semua nilai** sesuai server, database, dan preferensi Anda (folder tujuan lokal, pengaturan GDrive, detail bot Telegram).
+        * **PENTING**: Di bagian `[MAIN]`, atur `default_backup_mode = ssh` atau `default_backup_mode = lokal` sesuai mode backup utama Anda.
 
 5.  **Siapkan Google Drive (OAuth 2.0 Desktop App):**
-    * Pergi ke [Google Cloud Console > API & Services > Credentials](https://console.cloud.google.com/apis/credentials).
+    * Pergi ke [Google Cloud Console > API & Services > Credentials](https://console.cloud.com/apis/credentials).
     * Buat **"OAuth client ID"** baru, pilih **"Desktop app"**.
     * Unduh file JSON, lalu **ubah namanya menjadi `client_secrets.json`**.
     * Tempatkan `client_secrets.json` ini di direktori yang sama dengan `TukangBackup.pykit`.
@@ -78,8 +81,8 @@ Sebuah alat backup database MySQL/MariaDB otomatis via SSH yang **simpel, andal,
     * Buka `https://api.telegram.org/bot[YOUR_BOT_TOKEN]/getUpdates` di browser Anda untuk mendapatkan **Chat ID**.
     * Isi `telegram_bot_token` dan `telegram_chat_id` di `config.ini`.
 
-7.  **Setup Kunci SSH (Jika belum):**
-    * Pastikan PC/server yang menjalankan script dapat login ke server database via SSH tanpa password (gunakan SSH Key).
+7.  **Setup Kunci SSH (Untuk mode `ssh-backup` jika belum):**
+    * Pastikan PC/server yang menjalankan script dapat login ke server database remote via SSH tanpa password (gunakan SSH Key).
     ```bash
     # Buat kunci baru jika belum ada
     ssh-keygen -t rsa -b 4096
@@ -94,10 +97,21 @@ Sebuah alat backup database MySQL/MariaDB otomatis via SSH yang **simpel, andal,
 
 Pastikan Anda berada di dalam direktori proyek dan **virtual environment Anda aktif**.
 
-* **Menjalankan Proses Backup Penuh:**
+* **Menjalankan Backup via SSH:**
+    (Gunakan ini jika skrip berada di PC terpisah dari server database).
     ```bash
-    python TukangBackup.pykit backup
-    # ATAU
+    python TukangBackup.pykit ssh-backup
+    ```
+
+* **Menjalankan Backup Lokal:**
+    (Gunakan ini jika skrip berada di server database itu sendiri).
+    ```bash
+    python TukangBackup.pykit lokal-backup
+    ```
+
+* **Menjalankan Backup dengan Mode Default (`config.ini`):**
+    (Akan menggunakan `default_backup_mode` yang diset di `config.ini`).
+    ```bash
     python TukangBackup.pykit
     ```
 
@@ -146,12 +160,12 @@ Untuk menjalankan backup secara otomatis menggunakan Cron Job:
     ```
 2.  Tambahkan baris berikut di akhir file (sesuaikan jadwal dan path-nya):
     ```crontab
-    0 3 * * * /usr/bin/python3 /path/to/TukangBackup.pykit backup >> /var/log/tukangbackup.log 2>&1
+    0 3 * * * /usr/bin/python3 /path/to/TukangBackup.pykit [backup_mode] >> /var/log/tukangbackup.log 2>&1
     ```
     * **`0 3 * * *`**: Jadwal (di sini, setiap hari jam 3 pagi). Format: `menit jam hari_bulan bulan hari_minggu`.
     * **`/usr/bin/python3`**: Path lengkap ke interpreter Python Anda (gunakan `which python3` untuk mencari).
     * **`/path/to/TukangBackup.pykit`**: Path lengkap ke skrip Anda (misalnya, `/home/user/my_backup_project/TukangBackup.pykit`).
-    * **`backup`**: Command yang akan dijalankan oleh skrip.
+    * **`[backup_mode]`**: Ganti dengan `ssh-backup` (untuk mode SSH) atau `lokal-backup` (untuk mode lokal). Anda juga bisa menghapus `[backup_mode]` jika ingin Cron menggunakan `default_backup_mode` dari `config.ini`.
     * **`>> /var/log/tukangbackup.log 2>&1`**: Mengarahkan output dan error ke file log untuk debugging (disarankan).
 3.  Simpan dan keluar dari editor (biasanya Ctrl+X, Y, Enter untuk nano).
 
@@ -164,7 +178,7 @@ Jika Anda mengalami error Google Drive (misalnya, `HttpError`, `token expired`, 
 1.  **Jalankan ulang `python TukangBackup.pykit test-gdrive`**. Ini akan memicu ulang proses otentikasi browser jika token sudah kedaluwarsa atau ada masalah koneksi.
 2.  Pastikan file **`client_secrets.json`** sudah benar dan berada di folder yang sama dengan skrip.
 3.  Pastikan **`destination_folder_id`** di `config.ini` hanya berisi ID folder (misalnya, `1bFvBiosNkCvdAwjxuy7avjSBKGBgKW-N`), tanpa komentar atau karakter tambahan.
-4.  Periksa izin akun Google Anda di Google Drive. Akun yang digunakan harus memiliki izin `Editor` atau `Kontributor` pada folder tujuan.
+4.  Periksa izin akun Google Anda di Google Drive. Akun yang digunakan harus memiliki izin `Editor` atau `Contributor` pada folder tujuan.
 5.  Jika masalah berlanjut, hapus file **`credentials.json`** di folder skrip Anda, lalu jalankan kembali `test-gdrive`. Ini akan memaksa otentikasi ulang dari awal.
 
 ---
